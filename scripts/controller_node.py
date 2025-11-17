@@ -4,9 +4,11 @@ from cv_bridge import CvBridge
 from rosgraph_msgs.msg import Clock
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
+from lane_follower import LaneFollower
+
+
 
 #list of states start timer, line follow 1, read clue, car part, dirt road, baby yoda...
-
 class ControllerNode:
     def __init__(self):
         rospy.init_node('controller_node')
@@ -17,7 +19,7 @@ class ControllerNode:
         self.image_sub = rospy.Subscriber('/camera/image_raw', Image, self.image_callback)
         self.clock_sub = rospy.Subscriber('/clock', Clock, self.clock_callback)
 
-        self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+        self.cmd_pub = rospy.Publisher('/b1cmd_vel', Twist, queue_size=10)
         self.score_pub = rospy.Publisher('/score', String, queue_size=10)
 
         self.state = 1  # Initial state
@@ -26,11 +28,11 @@ class ControllerNode:
         rospy.spin()
 
     def state_machine(self):
-        if self.state == 1:
+        if self.state == States.START_TIMER:
             self.send_start_timer()
-            self.state = 2
+            self.state = States.LINE_FOLLOW
             return
-        elif self.state == 2:
+        elif self.state == States.LINE_FOLLOW:
             # State 2 behavior
             pass
         
@@ -51,12 +53,12 @@ class ControllerNode:
 
     def start_timer(self):
         msg = String()
-        msg.data = ""
+        msg.data = "0"
         self.score_pub.publish(msg)
 
     def stop_timer(self):
         msg = String()
-        msg.data = "stop"
+        msg.data = "1"
         self.score_pub.publish(msg)
 
     def send_clue(self, location, text):
@@ -68,5 +70,10 @@ if __name__ == '__main__':
     controller_node = ControllerNode()
     rospy.spin()
 
+class States:
+    START_TIMER = 1
+    LINE_FOLLOW = 2
+    READ_CLUE = 3
+    #tbd other states
 
     
