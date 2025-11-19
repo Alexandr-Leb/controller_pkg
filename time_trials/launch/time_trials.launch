@@ -1,0 +1,14 @@
+<launch>
+    <!-- My Package launch file-->
+    <node pkg="time_trials"
+          type="time_trials_move.py"
+          name="time_trials_move"
+          output="screen"/>
+
+    <node pkg="image_view"
+          type="image_view"
+          name="B1_camera_view"
+          output="screen">
+        <remap from="image" to="/B1/rrbot/camera1/image_raw" />
+    </node>
+</launch>
