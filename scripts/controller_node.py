@@ -306,13 +306,14 @@ class ControllerNode:
             bottom_strings = self.classify_word_groups(bottom_words)
 
             # 5 — send to score tracker
-            self.clue_board_number += self.clue_board_number+1
+            self.clue_board_number += 1
             msg = String()
             bottom_text = " ".join(bottom_strings) if bottom_strings else ""
             msg.data = f"TeamRed,multi21,{self.clue_board_number},{bottom_text}"
             self.score_pub.publish(msg)
 
             # Print out results
+            rospy.loginfo(f"{self.clue_board_number},{bottom_text}")
             rospy.loginfo(f"TOP WORDS: {top_strings}")
             rospy.loginfo(f"BOTTOM WORDS: {bottom_strings}")
 
