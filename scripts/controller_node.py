@@ -50,6 +50,7 @@ class ControllerNode:
         self.sign_captured = {0: False, 1: False, 2: False, 3: False, 4: False}
         self.current_phase = None
         self.sign_cooldown_time = rospy.Time(0)
+        self.clue_board_number = 0  # To track clue board submissions
         
         # Loop distance tracking (for knowing when to exit)
         self.loop_distance = 0.0
@@ -303,6 +304,13 @@ class ControllerNode:
             # 4 — classify letters with TFLite
             top_strings = self.classify_word_groups(top_words)
             bottom_strings = self.classify_word_groups(bottom_words)
+
+            # 5 — send to score tracker
+            self.clue_board_number += self.clue_board_number+1
+            msg = String()
+            bottom_text = " ".join(bottom_strings) if bottom_strings else ""
+            msg.data = f"TeamRed,multi21,{self.clue_board_number},{bottom_text}"
+            self.score_pub.publish(msg)
 
             # Print out results
             rospy.loginfo(f"TOP WORDS: {top_strings}")
