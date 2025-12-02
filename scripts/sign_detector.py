@@ -168,3 +168,195 @@ class SignDetector:
         bottom_left = pts[np.argmax(diff)]
         
         return np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
+    
+    def warp_gray_square(self, warped_img):
+        """
+        Detect and crop to the gray/white clueboard background
+        by thresholding low-saturation pixels.
+        """
+
+        hsv = cv.cvtColor(warped_img, cv.COLOR_BGR2HSV)
+
+        h, s, v = cv.split(hsv)
+
+        # Gray box = low saturation but reasonably bright
+        gray_mask = cv.inRange(s, 0, 60) & cv.inRange(v, 80, 255)
+
+        # Remove tiny specks
+        kernel = np.ones((5, 5), np.uint8)
+        gray_mask = cv.morphologyEx(gray_mask, cv.MORPH_CLOSE, kernel)
+        gray_mask = cv.morphologyEx(gray_mask, cv.MORPH_OPEN, kernel)
+
+        # Find bounding box of the gray region
+        ys, xs = np.where(gray_mask > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            print("⚠ Could not find gray region")
+            return warped_img
+
+        x1, x2 = xs.min(), xs.max()
+        y1, y2 = ys.min(), ys.max()
+
+        # Crop to gray board region
+        cropped = warped_img[y1:y2, x1:x2]
+
+        # FINAL SHRINK: trim a small fraction from each edge to avoid residual blue
+        SHRINK_FRAC = 0.02  # 2% trim on each side (tweak as needed)
+        Hc, Wc = cropped.shape[:2]
+        cx = int(Wc * SHRINK_FRAC)
+        cy = int(Hc * SHRINK_FRAC)
+
+        # Defensive checks
+        if cx * 2 >= Wc or cy * 2 >= Hc:
+            return cropped
+
+        try:
+            inner = cropped[cy:Hc - cy, cx:Wc - cx]
+            if inner.size == 0:
+                return cropped
+            # resize back to original cropped size so downstream code sees same dims
+            final = cv.resize(inner, (Wc, Hc), interpolation=cv.INTER_LINEAR)
+            return final
+        except Exception:
+            return cropped
+
+    
+    def extract_letters_only(self, gray_img):
+        """
+        Extract ONLY blue letters from the clueboard.
+        No blur, no smoothing, no distortion.
+        Returns a binary mask with white letters on black background.
+        """
+
+        # Convert to HSV (even if already warped grayscale)
+        hsv = cv.cvtColor(gray_img, cv.COLOR_BGR2HSV)
+
+        # Pure blue letter mask
+        lower_blue = np.array([105, 120, 40])
+        upper_blue = np.array([135, 255, 255])
+
+        mask = cv.inRange(hsv, lower_blue, upper_blue)
+
+       
+
+        return mask
+    
+    def _resize_letter_for_cnn(self, crop, out_w, out_h):
+        """Resizes a cropped letter to CNN size while keeping aspect ratio."""
+        h, w = crop.shape
+
+        # Scale with preserved aspect ratio
+        scale = min(out_w / float(w), out_h / float(h))
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+
+        # Resize letter
+        resized = cv.resize(crop, (new_w, new_h), interpolation=cv.INTER_NEAREST)
+
+        # Create padded output canvas
+        canvas = np.zeros((out_h, out_w), dtype=np.uint8)
+        x_offset = (out_w - new_w) // 2
+        y_offset = (out_h - new_h) // 2
+
+        canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+
+        return canvas
+
+    
+    def segment_words(self, letter_mask):
+        H, W = letter_mask.shape
+
+        # Split horizontally
+        top_region = letter_mask[0:int(0.45 * H), :]
+        bottom_region = letter_mask[int(0.45 * H):H, :]
+
+        bottom_offset = int(0.45 * H)
+
+        # Extract letters separately
+        top_raw = self._segment_letters_region(top_region, y_offset=0)
+        bottom_raw = self._segment_letters_region(bottom_region, y_offset=bottom_offset)
+
+        # Sort left→right
+        top_raw.sort(key=lambda t: t[0])
+        bottom_raw.sort(key=lambda t: t[0])
+
+        # Convert into word groups
+        top_words = self.group_letters_into_words(top_raw)
+        bottom_words = self.group_letters_into_words(bottom_raw)
+
+        return top_words, bottom_words
+    
+    def _segment_letters_region(self, region_mask, y_offset):
+        num_labels, labels, stats, centroids = cv.connectedComponentsWithStats(region_mask)
+
+        letters = []
+
+        H_reg, W_reg = region_mask.shape[:2]
+        # Fractional padding to keep black space above/below letters (tweakable)
+        V_PAD_FRAC = 0.25   # pad 25% of letter height above and below
+        H_PAD_FRAC = 0.08   # small horizontal pad to avoid tight crop
+
+        for i in range(1, num_labels):
+            x, y, w, h, area = stats[i]
+
+            if area < 50:
+                continue
+
+            # compute padding in pixels (clamp to reasonable limits)
+            pad_y = max(2, int(h * V_PAD_FRAC))
+            pad_x = max(2, int(w * H_PAD_FRAC))
+
+            y0 = max(0, y - pad_y)
+            y1 = min(H_reg, y + h + pad_y)
+            x0 = max(0, x - pad_x)
+            x1 = min(W_reg, x + w + pad_x)
+
+            crop = region_mask[y0:y1, x0:x1]
+
+            # Resize for CNN (preserves black margins due to padding)
+            resized = self._resize_letter_for_cnn(crop, 200, 150)
+
+            # Store absolute X for word grouping (use x0 relative to region)
+            abs_x = x0
+
+            letters.append((abs_x, resized))
+
+        return letters
+    
+    def group_letters_into_words(self, letter_components):
+        if len(letter_components) == 0:
+            return []
+
+        xs = [c[0] for c in letter_components]
+        gaps = []
+
+        for i in range(len(xs)-1):
+            gaps.append(xs[i+1] - xs[i])
+
+        median_gap = np.median(gaps)
+        space_threshold = median_gap * 1.8   # tuning constant
+
+        words = []
+        current = []
+
+        for i, comp in enumerate(letter_components):
+            current.append(comp[1])
+
+            if i == len(gaps):
+                break
+
+            if gaps[i] > space_threshold:
+                words.append(current)
+                current = []
+
+        if current:
+            words.append(current)
+
+        return words
+
+
+
+
+
+
+
+
