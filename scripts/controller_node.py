@@ -16,6 +16,8 @@ from line_follower import LaneFollower
 from pink_line_detector import StripeDetector
 from sign_detector import SignDetector
 from tunnel_navigrator import TunnelNavigator
+from letter_classifier import LetterClassifier
+
 
 
 class ControllerNode:
@@ -50,6 +52,7 @@ class ControllerNode:
         self.sign_captured = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}
         self.current_phase = None
         self.sign_cooldown_time = rospy.Time(0)
+        self.clue_board_number = 0  # To track clue board submissions
         
         # Loop distance tracking
         self.loop_distance = 0.0
@@ -69,6 +72,10 @@ class ControllerNode:
         # Start keyboard listener
         self.key_thread = threading.Thread(target=self.listen_for_stop, daemon=True)
         self.key_thread.start()
+
+        # Start CNN classifier
+        self.classifier = LetterClassifier("/home/fizzer/ros_ws/src/controller_pkg/Util/conv_model(2).tflite")
+
     
     # ========== Keyboard Control ==========
     def listen_for_stop(self):
@@ -288,7 +295,21 @@ class ControllerNode:
             self.loop_complete = True
     
     # ========== Sign Detection and Capture ==========
-    def try_capture_sign(self, img, cmd, phase=None):
+    def classify_word_groups(self, groups):
+        """
+        groups: list of lists of letter images
+                Example: [ [L1,L2,L3], [L4,L5] ]
+        Returns: list of strings
+                Example: ["BIG", "HOUSE"]
+        """
+        words = []
+        for word in groups:
+            chars = [self.classifier.predict_letter(L) for L in word]
+            words.append("".join(chars))
+        return words
+
+
+    def try_capture_sign(self, img, cmd):
         """Align with sign and capture it"""
         now = rospy.Time.now()
         
@@ -334,12 +355,62 @@ class ControllerNode:
         
         # Capture it
         warped = self.sign_detector.warp_sign(img, sign["quad"])
-        
+
         if warped is not None:
-            phase_name = f"sign_phase_{target_phase}"
+            phase_name = f"sign_phase_{self.current_phase}"
             cv.imshow(phase_name, warped)
             cv.waitKey(1)
-            rospy.loginfo(f"Captured sign in phase {target_phase}")
+
+            # 1 — remove blue border → get gray interior board
+            gray_board = self.sign_detector.warp_gray_square(warped)
+            if gray_board is None:
+                rospy.loginfo("gray warp failed")
+                return cmd
+
+            cv.imshow("gray_board", gray_board)
+            cv.waitKey(1)
+
+            # 2 — extract only blue letters
+            letter_mask = self.sign_detector.extract_letters_only(gray_board)
+            cv.imshow("letter_mask", letter_mask)
+            cv.waitKey(1)
+
+            # 3 — segment into TOP words + BOTTOM words
+            top_words, bottom_words = self.sign_detector.segment_words(letter_mask)
+
+            # DEBUG visualization
+            for wi, word in enumerate(top_words):
+                for li, L in enumerate(word):
+                    cv.imshow(f"TOP_word{wi}_letter{li}", L)
+                    cv.waitKey(1)
+
+            for wi, word in enumerate(bottom_words):
+                for li, L in enumerate(word):
+                    cv.imshow(f"BOT_word{wi}_letter{li}", L)
+                    cv.waitKey(1)
+            # 4 — classify letters with TFLite
+            top_strings = self.classify_word_groups(top_words)
+            bottom_strings = self.classify_word_groups(bottom_words)
+
+            # 5 — send to score tracker
+            self.clue_board_number += 1
+            msg = String()
+            bottom_text = " ".join(bottom_strings) if bottom_strings else ""
+            msg.data = f"TeamRed,multi21,{self.clue_board_number},{bottom_text}"
+            self.score_pub.publish(msg)
+
+            # Print out results
+            rospy.loginfo(f"{self.clue_board_number},{bottom_text}")
+            rospy.loginfo(f"TOP WORDS: {top_strings}")
+            rospy.loginfo(f"BOTTOM WORDS: {bottom_strings}")
+
+
+        # mark the sign captured
+        self.sign_captured[self.current_phase] = True
+        self.sign_cooldown_time = now + rospy.Duration(3)
+        cmd.linear.x = 0
+        cmd.angular.z = 0
+        rospy.loginfo(f"Captured sign in phase {target_phase}")
         
         self.sign_captured[target_phase] = True
         
