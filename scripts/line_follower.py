@@ -29,9 +29,14 @@ class LaneFollower:
         self.number_of_allowed_missed_frames = 6
         self.prev_error = 0.0
         self.prev_time = None
+
+         # Memory for grass road (to smooth gaps)
+        self.last_grass_center = None
+        self.grass_frames_lost = 0
+        self.max_grass_lost_frames = 15  # Remember position for 3 frames
     
     # Main entry to driving
-    def get_command(self, img, center_bias=0.0):
+    def get_command(self, img, center_bias=0.0, speed = None):
         """Get driving command from image
         
         center_bias: -0.1 = aim left, 0.0 = aim center, 0.1 = aim right
@@ -39,17 +44,22 @@ class LaneFollower:
         # Find road center
         road_center, img_width = self.find_road_center(img)
         
+
+        # custom speed
+        use_speed = speed if speed is not None else self.speed
+
         # Calculate target position
         target_x = img_width * (0.5 + center_bias)
         
         # Generate movement command
-        twist = self.calculate_movement(road_center, target_x, img_width)
+        twist = self.calculate_movement(road_center, target_x, img_width, use_speed)
 
         return twist
     
     # easy function to switch between roads were driving on
     def find_road_center(self, img):
         """Find the center of the road - method depends on detection_mode"""
+        #rospy.loginfo(f"Detecting road in mode: {self.detection_mode}")
         if self.detection_mode == "asphalt":
             return self._detect_asphalt_road(img)
         elif self.detection_mode == "grass":
@@ -102,8 +112,154 @@ class LaneFollower:
         return center_x, w
     
     def _detect_grass_road(self, img):
-        # TODO: 
-        return self._detect_asphalt_road(img)
+        """Detect white lines on grass - intelligently follow with adaptive offset"""
+        h, w = img.shape[:2]
+        
+        skip_bottom = 200
+        roi_height = 170
+        
+        y_bottom = h - skip_bottom
+        y_top = max(0, y_bottom - roi_height)
+        
+        if y_top >= y_bottom:
+            return None, w
+        
+        roi = img[y_top:y_bottom, :]
+        roi = cv.medianBlur(roi, 5)
+        
+        hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV)
+        
+        lower_white = np.array([0, 18, 178])
+        upper_white = np.array([159, 87, 255])
+        
+        white_mask = cv.inRange(hsv, lower_white, upper_white)
+        
+        kernel = np.ones((5, 5), np.uint8)
+        white_mask = cv.morphologyEx(white_mask, cv.MORPH_OPEN, kernel)
+        white_mask = cv.morphologyEx(white_mask, cv.MORPH_CLOSE, kernel)
+        
+        # Find all contours
+        contours, _ = cv.findContours(white_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+        filtered_mask = np.zeros_like(white_mask)
+
+        min_contour_area = 600
+        max_contour_area = 20000          # reject huge blobs (tune)
+        min_height = 0.35 * roi_height    # a bit more forgiving than 0.5
+        max_lane_width_frac = 0.45        # lane should not span > ~45% of image width
+
+        left_candidates = []
+        right_candidates = []
+
+        for cnt in contours:
+            area = cv.contourArea(cnt)
+            if area < min_contour_area or area > max_contour_area:
+                continue
+
+            x, y, cw, ch = cv.boundingRect(cnt)
+
+            # Reject super-wide blobs (road patches, horizon bands, etc.)
+            if cw > max_lane_width_frac * w:
+                continue
+
+            if ch < min_height:
+                continue
+
+            cx = x + cw / 2.0  # contour center x
+
+            rospy.loginfo(
+                f"[GRASS DEBUG] contour passed area filter: "
+                f"area={area:.1f}, x={x}, y={y}, w={cw}, h={ch}, cx={cx:.1f}"
+            )
+
+            # Explicitly separate left vs right half of the image
+            if cx < w / 2.0:
+                left_candidates.append(cnt)
+            else:
+                right_candidates.append(cnt)
+
+        # Pick at most 1 lane per side (the largest by area)
+        line_contours = []
+
+        if left_candidates:
+            left_candidates = sorted(left_candidates, key=cv.contourArea, reverse=True)
+            line_contours.append(left_candidates[0])
+
+        if right_candidates:
+            right_candidates = sorted(right_candidates, key=cv.contourArea, reverse=True)
+            line_contours.append(right_candidates[0])
+
+        # Draw only these "lane" contours into filtered_mask
+        filtered_mask[:] = 0
+        for cnt in line_contours:
+            cv.drawContours(filtered_mask, [cnt], -1, 255, -1)
+
+
+
+        # Hole filling pass
+        contours_filled, _ = cv.findContours(filtered_mask, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE)
+        for i in range(len(contours_filled)):
+            cv.drawContours(filtered_mask, contours_filled, i, 255, -1)
+        
+        # Find ALL lane centers
+        contours_final, _ = cv.findContours(filtered_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        
+        lane_centers = []
+        
+        for cnt in contours_final:
+            M = cv.moments(cnt)
+            if M["m00"] > 0:
+                cx = M["m10"] / M["m00"]
+                lane_centers.append(cx)
+        
+        # SMART OFFSET CALCULATION
+        if len(lane_centers) >= 2:
+            # Can see BOTH lanes - drive exactly between them
+            lane_centers.sort()
+            left_lane = lane_centers[0]
+            right_lane = lane_centers[-1]
+            
+            # Center is exactly between the two lanes
+            center_x = (left_lane + right_lane) / 2.0
+            
+        elif len(lane_centers) == 1:
+            # Can see only ONE lane - offset based on lane width estimate
+            lane_pos = lane_centers[0]
+            img_center = w / 2.0
+            
+            # Estimate lane width (typical road lane spacing)
+            estimated_lane_width = 200  # pixels (tune this if needed)
+            
+            if lane_pos < img_center:
+                # Following LEFT lane - offset RIGHT by half lane width
+                center_x = lane_pos + 3.0*(estimated_lane_width / 2.0)
+            else:
+                # Following RIGHT lane - offset LEFT by half lane width
+                center_x = lane_pos - 3.0*(estimated_lane_width / 2.0)
+            
+        else:
+            # Lost both lanes - use memory
+            self.grass_frames_lost += 1
+            
+            if self.grass_frames_lost <= self.max_grass_lost_frames and self.last_grass_center is not None:
+                center_x = self.last_grass_center
+            else:
+                center_x = None
+            
+            cv.imshow("white_line_mask", filtered_mask)
+            cv.waitKey(1)
+            self._show_debug(img, y_top, y_bottom, center_x)
+            return center_x, w
+        
+        # Update memory
+        self.last_grass_center = center_x
+        self.grass_frames_lost = 0
+        
+        cv.imshow("white_line_mask", filtered_mask)
+        cv.waitKey(1)
+        self._show_debug(img, y_top, y_bottom, center_x)
+        
+        return center_x, w
     
     def _show_debug(self, img, y_top, y_bottom, center_x):
         """Show debug visualization"""
@@ -125,9 +281,11 @@ class LaneFollower:
         cv.waitKey(1)
     
 
-    def calculate_movement(self, center_x, target_x, img_width):
+    def calculate_movement(self, center_x, target_x, img_width, speed=None):
         """Calculate Twist command using PD control"""
         twist = Twist()
+
+        v_cmd = speed if speed is not None else self.speed
         
         # Update memory
         if center_x is not None:
@@ -158,7 +316,7 @@ class LaneFollower:
             # Limit turn speed
             turn_speed = np.clip(turn_speed, -self.max_turn_speed, self.max_turn_speed)
             
-            twist.linear.x = self.speed
+            twist.linear.x = v_cmd
             twist.angular.z = -turn_speed  # Negative because error is backwards
             
             self.prev_error = error
@@ -171,7 +329,7 @@ class LaneFollower:
                 error = self.last_center - target_x
                 direction = -1.0 if error > 0 else 1.0
                 
-                twist.linear.x = self.speed * 0.5
+                twist.linear.x = v_cmd * 0.5
                 twist.angular.z = direction * self.max_turn_speed * 0.5
             else:
                 # No idea where line is - just spin
