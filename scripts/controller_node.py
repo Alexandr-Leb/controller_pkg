@@ -16,6 +16,9 @@ from line_follower import LaneFollower
 from pink_line_detector import StripeDetector
 from sign_detector import SignDetector
 from letter_classifier import LetterClassifier
+from motion_detector import MotionDetector
+
+
 
 
 
@@ -24,39 +27,53 @@ class ControllerNode:
     
     def __init__(self):
         rospy.init_node("controller_node")
-        
+
         self.bridge = CvBridge()
-        
-        # ROS topics
+
+        # Topics (read params first)
         image_topic = rospy.get_param("~image_topic", "/B1/pi_camera/image_raw")
         cmd_topic = rospy.get_param("~cmd_vel_topic", "/B1/cmd_vel")
-        
-        self.image_sub = rospy.Subscriber(image_topic, Image, self.image_callback, queue_size=1)
+
+        # Publishers (safe to create early)
         self.cmd_pub = rospy.Publisher(cmd_topic, Twist, queue_size=10)
         self.score_pub = rospy.Publisher("/score_tracker", String, queue_size=1)
-        
+
         # Main components
         self.state_machine = StateMachine()
         self.lane_follower = LaneFollower(detection_mode="asphalt")
         self.stripe_detector = StripeDetector()
         self.sign_detector = SignDetector()
-        
+
         # Run status
         self.run_active = False
         self.stopped = False
-        
-        # Sign tracking - one sign per phase (0=start, 1=after crosswalk, 2=loop, 3=after loop)
+
+        # Pedestrian / crosswalk state (defaults)
+        self.crosswalk_active = False
+        self.crosswalk_cleared = False
+        self.last_red_y = None
+
+        # Boost forward parameters (used when crossing is clear)
+        self.boost_active = False
+        self.boost_end_time = rospy.Time(0)
+        self.boost_duration = rospy.get_param("~ped_boost_duration", 0.8)
+        self.boost_speed = rospy.get_param("~ped_boost_speed", 1.0)
+
+        # Motion-based pedestrian detector (frame-diff)
+        self.motion_detector = MotionDetector(min_area=1800, still_frames_needed=10)
+
+        # Sign tracking - one sign per phase
         self.sign_colors = {0: "dark_blue", 1: "dark_blue", 2: "light_blue", 3: "dark_blue", 4: "dark_blue"}
         self.sign_captured = {0: False, 1: False, 2: False, 3: False, 4: False}
         self.current_phase = None
         self.sign_cooldown_time = rospy.Time(0)
         self.clue_board_number = 0  # To track clue board submissions
-        
-        # Loop distance tracking (for knowing when to exit)
+
+        # Loop distance tracking
         self.loop_distance = 0.0
         self.last_time = None
         self.loop_complete = False
-        
+
         # Start keyboard listener
         self.key_thread = threading.Thread(target=self.listen_for_stop, daemon=True)
         self.key_thread.start()
@@ -64,6 +81,8 @@ class ControllerNode:
         # Start CNN classifier
         self.classifier = LetterClassifier("/home/fizzer/ros_ws/src/controller_pkg/Util/conv_model(2).tflite")
 
+        # Finally subscribe to the image topic AFTER all attributes are initialized
+        self.image_sub = rospy.Subscriber(image_topic, Image, self.image_callback, queue_size=1)
     
     # ========== Keyboard Control ==========
     def listen_for_stop(self):
@@ -121,13 +140,58 @@ class ControllerNode:
     def image_callback(self, image_msg):
         """Called every frame - this is the main control loop"""
         img = self.bridge.imgmsg_to_cv2(image_msg, "bgr8")
-        
-        # Detect crosswalk
-        _, crossed_crosswalk = self.stripe_detector.check_red_stripe(img)
+        cmd = Twist()
 
-        # Detect pink markers
-        _, crossed_pink_marker = self.stripe_detector.check_pink_stripe(img)
-        
+        # --- Detect red stripe ---
+        on_red, crossed_crosswalk, red_y = self.stripe_detector.check_red_stripe(img)
+
+        # ---------- RED LINE STOP ----------
+        if on_red and not self.crosswalk_active and not self.crosswalk_cleared:
+            rospy.loginfo("Crosswalk: STOPPING at red line")
+            self.crosswalk_active = True
+            self.crosswalk_cleared = False
+            self.motion_detector.reset()   # start fresh
+            cmd.linear.x = 0
+            cmd.angular.z = 0
+            self.cmd_pub.publish(cmd)
+            return
+
+
+        # ---------- If stopped at red line, check motion ----------
+        if self.crosswalk_active and not self.crosswalk_cleared:
+
+            H, W = img.shape[:2]
+            y1 = int(H * 2/8)
+            y2 = int(H * 5/8)
+
+            movement_region = img[y1:y2, :]
+
+            moving = self.motion_detector.check_motion(movement_region)
+
+            if moving:
+                rospy.loginfo_throttle(1.0, "Crosswalk: MOVEMENT detected → HOLD")
+                cmd.linear.x = 0
+                cmd.angular.z = 0
+                self.cmd_pub.publish(cmd)
+                return
+            else:
+                rospy.loginfo("Crosswalk: CLEAR → BOOST AND GO")
+                self.crosswalk_cleared = True
+                self.crosswalk_active = False
+
+                # BOOST SPEED
+                boost = Twist()
+                boost.linear.x = 1.0    # max speed
+                boost.angular.z = 0.0
+                self.cmd_pub.publish(boost)
+                rospy.sleep(0.8)        # short burst across crosswalk
+
+                return  # next callback resumes normal driving
+
+
+
+        on_pink, crossed_pink_marker = self.stripe_detector.check_pink_stripe(img)
+
         # Update state machine
         events = {
             "crossed_crosswalk": crossed_crosswalk,
@@ -143,7 +207,6 @@ class ControllerNode:
             self.start_run()
         
         # Get movement command
-        cmd = Twist()
         
         if self.run_active:
             drive_mode = actions["drive_mode"]
@@ -164,6 +227,7 @@ class ControllerNode:
             
             elif drive_mode == "in_loop":
                 # Bias left to stay in loop
+                # No vehicle-follow/stop logic — use normal lane following in loop
                 cmd = self.lane_follower.get_command(img, center_bias=0.035)
             
             elif drive_mode == "exit_loop":
@@ -201,7 +265,7 @@ class ControllerNode:
             self.last_time = now
         
         # Check if we've done one lap 
-        if self.loop_distance >= 14.0:
+        if self.loop_distance >= 15.0:
             self.loop_complete = True
     
     # ========== Sign Detection and Capture ==========

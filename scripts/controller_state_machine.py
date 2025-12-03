@@ -70,7 +70,7 @@ class StateMachine:
                 actions["sign_phase"] = 2
             
             # After enough frames, assume we've reached the loop
-            if self.frame_count > 320:
+            if self.frame_count > 325:
                 self._change_state(self.IN_LOOP)
         
         # ===== IN LOOP =====

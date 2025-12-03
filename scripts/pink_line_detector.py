@@ -31,68 +31,58 @@ class StripeDetector:
         y_top = max(0, y_bottom - self.roi_height)
         
         if y_top >= y_bottom:
-            return None
+            return None, None, None
         
         roi = img[y_top:y_bottom, :]
         
-        return roi
+        return roi, y_top, y_bottom
 
     
     def check_red_stripe(self, img):
-        """Check if we're over a red stripe
-        
-        Returns:
-            on_red: True if currently over red
-            crossed_second: True when we've crossed the second stripe
-        """
-        
-        roi = self.crop_frame_to_roi(img)
-
+        roi, y_top, y_bottom = self.crop_frame_to_roi(img)
         if roi is None:
-            return False, False
-        
-        # Detect red in HSV
+            return False, False, None
+
         hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV)
-        
-        # Red wraps around hue=0, so we need two ranges
+
         mask1 = cv.inRange(hsv, np.array([0, 120, 80]), np.array([10, 255, 255]))
         mask2 = cv.inRange(hsv, np.array([170, 120, 80]), np.array([180, 255, 255]))
-        
         mask = cv.bitwise_or(mask1, mask2)
-        
-        # Clean up noise
+
         kernel = np.ones((5, 5), np.uint8)
         mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
         mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
-        
-        # Check if enough red pixels
-        on_red = False
-        if cv.countNonZero(mask) > self.min_red_pixels:
-            on_red = True
-        
-        # Detect when we enter a new stripe (transition from no-red to red)
+
+        red_pixels = cv.findNonZero(mask)
+        on_red = red_pixels is not None and len(red_pixels) > self.min_red_pixels
+
+        red_y = None
+        if on_red:
+            ys = [p[0][1] for p in red_pixels]
+            median_y = int(np.median(ys))
+            red_y = y_top + median_y
+
         crossed_second = False
-        
         if on_red and not self.was_on_red:
-            # Just entered a stripe
             if self.stripe_count_red == 0:
                 self.stripe_count_red = 1
             elif self.stripe_count_red == 1:
                 self.stripe_count_red = 2
-                crossed_second = True  # Fire event once
-        
+                crossed_second = True
+
         self.was_on_red = on_red
-        
-        return on_red, crossed_second
+
+        return on_red, crossed_second, red_y
+
     
 
     def check_pink_stripe(self, img):
         """ Check if were over a pink stripe """
-        roi = self.crop_frame_to_roi(img)
+        roi, y_top, y_bottom = self.crop_frame_to_roi(img)
 
         if roi is None:
             return False, False
-        
+
         hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV)
         
         lower_pink = np.array([135, 80, 80])
@@ -116,4 +106,3 @@ class StripeDetector:
         self.was_on_pink = on_pink
         
         return on_pink, crossed_pink  # Return both values like red stripe
-            
