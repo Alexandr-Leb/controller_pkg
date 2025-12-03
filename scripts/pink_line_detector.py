@@ -5,28 +5,25 @@ import numpy as np
 
 
 class StripeDetector:
-    """Detects red crosswalk stripes and counts when we cross them"""
+    """Detects red crosswalk stripes and pink markers"""
     
     def __init__(self):
         # ROI settings
         self.roi_height = 150
         self.skip_bottom = 120
         self.min_red_pixels = 1500
-        self.min_pink_pixels = 100
+        self.min_pink_pixels = 1500
         
         # Tracking
         self.was_on_red = False
         self.was_on_pink = False
-        self.stripe_count_red = 0  # 0=none, 1=first seen, 2=both seen
+        self.stripe_count_red = 0
         self.stripe_count_pink = 0
 
-        self.pink_crossed_frames_remaining = 0
-
     def crop_frame_to_roi(self, img):
-        """ Crops the image to a chosen region of interest """
+        """Crops the image to a chosen region of interest"""
         h, w = img.shape[:2]
         
-        # Define ROI at bottom of image
         y_bottom = h - self.skip_bottom
         y_top = max(0, y_bottom - self.roi_height)
         
@@ -37,7 +34,6 @@ class StripeDetector:
         
         return roi, y_top, y_bottom
 
-    
     def check_red_stripe(self, img):
         roi, y_top, y_bottom = self.crop_frame_to_roi(img)
         if roi is None:
@@ -68,17 +64,18 @@ class StripeDetector:
                 self.stripe_count_red = 1
             elif self.stripe_count_red == 1:
                 self.stripe_count_red = 2
-                crossed_second = True
-
+                crossed_second = True  # Fire event once
+        
         self.was_on_red = on_red
 
         return on_red, crossed_second, red_y
 
     
-
     def check_pink_stripe(self, img):
         """ Check if were over a pink stripe """
         roi, y_top, y_bottom = self.crop_frame_to_roi(img)
+        """Check if we're over a pink stripe"""
+        roi = self.crop_frame_to_roi(img)
 
         if roi is None:
             return False, False
@@ -96,12 +93,12 @@ class StripeDetector:
         
         on_pink = cv.countNonZero(mask) > self.min_pink_pixels
         
-        crossed_pink = False  # This should return when crossing occurs
+        crossed_pink = False
         
+        # Fire pulse on rising edge (off->on)
         if on_pink and not self.was_on_pink:
-            if self.stripe_count_pink == 0:
-                self.stripe_count_pink = 1
-                crossed_pink = True  # Fire event on first pink crossing
+            self.stripe_count_pink += 1
+            crossed_pink = True
         
         self.was_on_pink = on_pink
         
