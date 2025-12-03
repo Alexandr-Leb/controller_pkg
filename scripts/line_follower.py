@@ -179,3 +179,64 @@ class LaneFollower:
                 twist.angular.z = 1.0
         
         return twist
+    
+    def get_command_left_contour(self, img, min_contour_area=500, center_bias=0.0, left_bias=0.05):
+        """
+        Follow the left-hand white contour and produce a Twist.
+        Finds the leftmost sufficiently-large white contour in the same ROI used
+        for asphalt detection and treats that contour's centroid as the 'center_x'
+        passed to calculate_movement (target is image center +/- center_bias).
+        Accepts optional center_bias to remain API-compatible with get_command.
+        left_bias (fraction of image width) nudges the target left (default 0.05).
+        Returns a geometry_msgs.msg.Twist (same semantics as get_command).
+        """
+        h, w = img.shape[:2]
+
+        # same ROI as _detect_asphalt_road
+        y_bottom = h - self.skip_bottom
+        y_top = max(0, y_bottom - self.roi_height)
+        if y_top >= y_bottom:
+            return Twist()
+
+        roi = img[y_top:y_bottom, :]
+
+        # Convert to HSV and make a white-ish mask (low saturation, high value)
+        hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV)
+        _, s_channel, v_channel = cv.split(hsv)
+
+        low_sat_mask = cv.inRange(s_channel, 0, 60)
+        high_val_mask = cv.inRange(v_channel, 180, 255)
+        mask = cv.bitwise_and(low_sat_mask, high_val_mask)
+
+        # Clean mask
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
+        mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
+
+        # Find contours and choose leftmost qualifying contour
+        contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return Twist()
+
+        leftmost_contour = None
+        leftmost_x = float('inf')
+        for c in contours:
+            area = cv.contourArea(c)
+            if area < min_contour_area:
+                continue
+            x, y, bw, bh = cv.boundingRect(c)
+            if x < leftmost_x:
+                leftmost_x = x
+                leftmost_contour = (x, y, bw, bh)
+
+        if leftmost_contour is None:
+            return Twist()
+
+        x, y, bw, bh = leftmost_contour
+        center_x_roi = float(x + bw / 2.0)
+
+        # Apply center_bias and an additional left_bias to nudge target leftward
+        target_x = float(w * (0.5 + center_bias - left_bias))
+
+        # Use the same calculate_movement helper so behavior matches existing PD tuning
+        return self.calculate_movement(center_x_roi, target_x, img_width=w)

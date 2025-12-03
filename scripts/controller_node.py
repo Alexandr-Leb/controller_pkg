@@ -62,6 +62,9 @@ class ControllerNode:
         # Motion-based pedestrian detector (frame-diff)
         self.motion_detector = MotionDetector(min_area=1800, still_frames_needed=10)
 
+        # New: track when we first enter the IN_LOOP drive mode
+        self.in_loop_start_time = None
+
         # Sign tracking - one sign per phase
         self.sign_colors = {0: "dark_blue", 1: "dark_blue", 2: "light_blue", 3: "dark_blue", 4: "dark_blue"}
         self.sign_captured = {0: False, 1: False, 2: False, 3: False, 4: False}
@@ -219,23 +222,44 @@ class ControllerNode:
                 self.lane_follower.detection_mode = "asphalt"
             
             # Lane following with different biases for different sections
-            if drive_mode == "normal":
-                cmd = self.lane_follower.get_command(img, center_bias=0.0)
-            
-            elif drive_mode == "after_crosswalk":
-                cmd = self.lane_follower.get_command(img, center_bias=0.0)
-            
-            elif drive_mode == "in_loop":
-                # Bias left to stay in loop
-                # No vehicle-follow/stop logic — use normal lane following in loop
-                cmd = self.lane_follower.get_command(img, center_bias=0.035)
-            
-            elif drive_mode == "exit_loop":
-                # Bias left to take exit
-                cmd = self.lane_follower.get_command(img, center_bias=-0.15)
+            try:
+                if drive_mode == "normal":
+                    cmd = self.lane_follower.get_command(img, center_bias=0.0)
+                
+                elif drive_mode == "after_crosswalk":
+                    cmd = self.lane_follower.get_command(img, center_bias=0.0)
+                
+                elif drive_mode == "in_loop":
+                    # On entering IN_LOOP record start time
+                    if self.in_loop_start_time is None:
+                        self.in_loop_start_time = rospy.Time.now()
 
-            # elif drive_mode == "grass_road":
-            #     cmd = self.lane_follower.get_command(img, center_bias=0.0)
+                    # First 3 seconds: use standard lane follower with left bias, then switch
+                    elapsed = rospy.Time.now() - self.in_loop_start_time
+                    if elapsed < rospy.Duration(3.0):
+                        cmd = self.lane_follower.get_command(img, center_bias=0.035)
+                    else:
+                        # After 3s switch to left-contour follower
+                        cmd = self.lane_follower.get_command_left_contour(img, center_bias=0.035)
+                
+                elif drive_mode == "exit_loop":
+                    # Bias left to take exit
+                    cmd = self.lane_follower.get_command(img, center_bias=-0.15)
+
+                else:
+                    # Unknown mode — safe fallback
+                    cmd = self.lane_follower.get_command(img, center_bias=0.0)
+
+            except Exception as e:
+                # Log the exception and publish a safe stop instead of crashing
+                rospy.logerr("Lane follower error for mode '%s': %s", drive_mode, e)
+                cmd = Twist()
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
+
+            # If we've left IN_LOOP, reset the in-loop timer so it restarts next time we enter
+            if drive_mode != "in_loop":
+                self.in_loop_start_time = None
             
             # Try to capture sign if we haven't yet in this phase
             if self.current_phase is not None and not self.sign_captured[self.current_phase]:
@@ -265,7 +289,7 @@ class ControllerNode:
             self.last_time = now
         
         # Check if we've done one lap 
-        if self.loop_distance >= 15.0:
+        if self.loop_distance >= 13.0:
             self.loop_complete = True
     
     # ========== Sign Detection and Capture ==========
