@@ -72,34 +72,37 @@ class StripeDetector:
 
     
     def check_pink_stripe(self, img):
-        """ Check if were over a pink stripe """
-        roi, y_top, y_bottom = self.crop_frame_to_roi(img)
-        """Check if we're over a pink stripe"""
-        roi = self.crop_frame_to_roi(img)
+        """ Check if we're over a pink stripe """
+        roi_y = self.crop_frame_to_roi(img)
+        # crop_frame_to_roi returns (roi, y_top, y_bottom)
+        if roi_y is None:
+            return False, False
+
+        roi, y_top, y_bottom = roi_y
 
         if roi is None:
             return False, False
 
         hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV)
-        
+
         lower_pink = np.array([135, 80, 80])
         upper_pink = np.array([175, 255, 255])
-        
+
         mask = cv.inRange(hsv, lower_pink, upper_pink)
-        
+
         kernel = np.ones((5, 5), np.uint8)
         mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
         mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
-        
+
         on_pink = cv.countNonZero(mask) > self.min_pink_pixels
-        
+
         crossed_pink = False
-        
+
         # Fire pulse on rising edge (off->on)
         if on_pink and not self.was_on_pink:
             self.stripe_count_pink += 1
             crossed_pink = True
-        
+
         self.was_on_pink = on_pink
-        
-        return on_pink, crossed_pink  # Return both values like red stripe
+
+        return on_pink, crossed_pink
