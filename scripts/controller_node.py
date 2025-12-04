@@ -17,11 +17,12 @@ from pink_line_detector import StripeDetector
 from sign_detector import SignDetector
 from tunnel_navigrator import TunnelNavigator
 from letter_classifier import LetterClassifier
+from motion_detector import MotionDetector
 
 
 
 class ControllerNode:
-    """Main robot controller - handles lane following, signs, and tunnel navigation"""
+    """Main robot controller - handles lane following, signs, pedestrian detection, and tunnel navigation"""
     
     def __init__(self):
         rospy.init_node("controller_node")
@@ -32,7 +33,7 @@ class ControllerNode:
         image_topic = rospy.get_param("~image_topic", "/B1/pi_camera/image_raw")
         cmd_topic = rospy.get_param("~cmd_vel_topic", "/B1/cmd_vel")
         
-        self.image_sub = rospy.Subscriber(image_topic, Image, self.image_callback, queue_size=1)
+        # Publishers (create before subscriber)
         self.cmd_pub = rospy.Publisher(cmd_topic, Twist, queue_size=10)
         self.score_pub = rospy.Publisher("/score_tracker", String, queue_size=1)
         
@@ -46,28 +47,49 @@ class ControllerNode:
         # Run status
         self.run_active = False
         self.stopped = False
+
+        self.run_start_time = None
+        self.run_max_duration = 240
         
-        # Sign tracking
+        # ========== Pedestrian / Crosswalk Detection ==========
+        self.crosswalk_active = False
+        self.crosswalk_cleared = False
+        
+        self.motion_detector = MotionDetector(
+            min_area=2000,
+            still_frames_needed=15,
+            motion_frames_needed=5
+        )
+        
+        # Boost parameters
+        self.boost_duration = rospy.get_param("~ped_boost_duration", 0.5)
+        self.boost_speed = rospy.get_param("~ped_boost_speed", 1.0)
+        
+        # ========== Sign tracking ==========
         self.sign_colors = {0: "dark_blue", 1: "dark_blue", 2: "light_blue", 3: "dark_blue", 4: "dark_blue", 5: "dark_blue", 6: "dark_blue", 7: "dark_blue"}
         self.sign_captured = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}
         self.current_phase = None
         self.sign_cooldown_time = rospy.Time(0)
-        self.clue_board_number = 0  # To track clue board submissions
+        self.clue_board_number = 0
         
-        # Loop distance tracking
+        # ========== Loop distance tracking ==========
         self.loop_distance = 0.0
         self.last_time = None
         self.loop_complete = False
+        self.in_loop_start_time = None
 
-        # Recovery maneuver after grass sign
-        self.grass_sign_recovery = False
-        self.recovery_frames = 0
-        self.recovery_duration = 10
-        
-        # Pre-tunnel forward drive
+        # ========== GRASS SIGN RECOVERY (PHASE 4) ==========
+        # States: "inactive", "pausing", "turning"
+        self.grass_recovery_state = "inactive"
+        self.grass_recovery_start_time = None
+        self.grass_recovery_pause_duration = 1.0  # 1 second pause before turning
+        self.grass_recovery_turn_frames = 0
+        self.grass_recovery_turn_duration = 15  # frames of turning
+
+        # ========== Pre-tunnel forward drive ==========
         self.pre_tunnel_forward = False
         self.pre_tunnel_frames = 0
-        self.pre_tunnel_duration = 20  # Drive forward for 20 frames before starting tunnel search
+        self.pre_tunnel_duration = 20
 
         # Start keyboard listener
         self.key_thread = threading.Thread(target=self.listen_for_stop, daemon=True)
@@ -76,10 +98,16 @@ class ControllerNode:
         # Start CNN classifier
         self.classifier = LetterClassifier("/home/fizzer/ros_ws/src/controller_pkg/Util/conv_model(2).tflite")
 
+        # Subscribe AFTER all init
+        self.image_sub = rospy.Subscriber(image_topic, Image, self.image_callback, queue_size=1)
+        
+        rospy.loginfo("="*60)
+        rospy.loginfo("ControllerNode initialized")
+        rospy.loginfo("="*60)
+
     
     # ========== Keyboard Control ==========
     def listen_for_stop(self):
-        """Background thread - press 'q' + Enter to stop"""
         rospy.loginfo("Press 'q' + Enter to stop the robot")
         while not rospy.is_shutdown():
             key = sys.stdin.read(1)
@@ -89,7 +117,6 @@ class ControllerNode:
     
     # ========== Start/Stop Functions ==========
     def start_run(self):
-        """Send START message to score tracker"""
         timeout = rospy.Time.now() + rospy.Duration(2.0)
         while self.score_pub.get_num_connections() == 0 and rospy.Time.now() < timeout:
             rospy.sleep(0.1)
@@ -98,11 +125,10 @@ class ControllerNode:
         msg.data = "TeamRed,multi21,0,WHATEVER"
         self.score_pub.publish(msg)
         rospy.loginfo("Started run")
-        
         self.run_active = True
+        self.run_start = rospy.Time.now()
     
     def stop_run(self):
-        """Send STOP message and halt robot"""
         if self.stopped:
             return
         
@@ -127,20 +153,122 @@ class ControllerNode:
     
     # ========== Main Image Processing Loop ==========
     def image_callback(self, image_msg):
-        """Called every frame - this is the main control loop"""
         img = self.bridge.imgmsg_to_cv2(image_msg, "bgr8")
-
+        cmd = Twist()
         now = rospy.Time.now()
-        
-        # Detect crosswalk
-        _, crossed_crosswalk = self.stripe_detector.check_red_stripe(img)
 
-        # Detect pink markers
+        if self.run_active and self.run_start_time is not None:
+            if rospy.Time.now() - self.run_start_time >= rospy.Duration(self.run_max_duration):
+                self.stop_run()
+                return
+        
+        # ==================== GRASS SIGN RECOVERY - HIGHEST PRIORITY ====================
+        # This is checked FIRST, before anything else
+        if self.grass_recovery_state != "inactive":
+            rospy.loginfo(f"[GRASS RECOVERY] State: {self.grass_recovery_state}")
+            
+            if self.grass_recovery_state == "pausing":
+                # Stop and wait for 1 second
+                elapsed = (now - self.grass_recovery_start_time).to_sec()
+                rospy.loginfo(f"[GRASS RECOVERY] PAUSING... elapsed={elapsed:.2f}s / {self.grass_recovery_pause_duration}s")
+                
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
+                self.cmd_pub.publish(cmd)
+                
+                if elapsed >= self.grass_recovery_pause_duration:
+                    rospy.loginfo("[GRASS RECOVERY] Pause complete, starting RIGHT TURN")
+                    self.grass_recovery_state = "turning"
+                    self.grass_recovery_turn_frames = 0
+                return
+            
+            elif self.grass_recovery_state == "turning":
+                # Execute right turn
+                self.grass_recovery_turn_frames += 1
+                rospy.loginfo(f"[GRASS RECOVERY] TURNING RIGHT... frame {self.grass_recovery_turn_frames}/{self.grass_recovery_turn_duration}")
+                
+                cmd.linear.x = 0.0
+                cmd.angular.z = -1.8  # Turn RIGHT
+                self.cmd_pub.publish(cmd)
+                
+                if self.grass_recovery_turn_frames >= self.grass_recovery_turn_duration:
+                    rospy.loginfo("[GRASS RECOVERY] *** RIGHT TURN COMPLETE ***")
+                    self.grass_recovery_state = "inactive"
+                return
+        
+        # ==================== CROSSWALK / PEDESTRIAN DETECTION ====================
+        red_stripe_result = self.stripe_detector.check_red_stripe(img)
+        
+        if len(red_stripe_result) == 3:
+            on_red, crossed_crosswalk, red_y = red_stripe_result
+        else:
+            on_red, crossed_crosswalk = red_stripe_result
+        
+        # Stop at FIRST red line
+        if on_red and not self.crosswalk_active and not self.crosswalk_cleared:
+            rospy.loginfo("="*60)
+            rospy.loginfo("[CROSSWALK] STOPPING AT RED LINE!")
+            rospy.loginfo("[CROSSWALK] Waiting for pedestrian...")
+            rospy.loginfo("="*60)
+            
+            self.crosswalk_active = True
+            self.crosswalk_cleared = False
+            self.motion_detector.reset()
+            
+            cmd.linear.x = 0
+            cmd.angular.z = 0
+            self.cmd_pub.publish(cmd)
+            return
+        
+        # If stopped, check for pedestrian
+        if self.crosswalk_active and not self.crosswalk_cleared:
+            H, W = img.shape[:2]
+            y1 = int(H * 2 / 8)
+            y2 = int(H * 5 / 8)
+            movement_region = img[y1:y2, :]
+            
+            # Debug: show monitoring region
+            debug_img = img.copy()
+            cv.rectangle(debug_img, (0, y1), (W, y2), (0, 255, 255), 2)
+            if self.motion_detector.has_seen_motion:
+                cv.putText(debug_img, "PEDESTRIAN DETECTED - waiting to pass", (10, y1 - 10), 
+                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            else:
+                cv.putText(debug_img, "WAITING FOR PEDESTRIAN...", (10, y1 - 10), 
+                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            #cv.imshow("crosswalk_view", debug_img)
+            cv.waitKey(1)
+            
+            should_wait = self.motion_detector.check_motion(movement_region)
+            
+            if should_wait:
+                cmd.linear.x = 0
+                cmd.angular.z = 0
+                self.cmd_pub.publish(cmd)
+                return
+            else:
+                # Clear to cross!
+                rospy.loginfo("="*60)
+                rospy.loginfo("[CROSSWALK] *** CLEAR TO GO! ***")
+                rospy.loginfo("="*60)
+                
+                self.crosswalk_cleared = True
+                self.crosswalk_active = False
+                
+                # Boost across
+                boost = Twist()
+                boost.linear.x = self.boost_speed
+                boost.angular.z = 0.0
+                self.cmd_pub.publish(boost)
+                rospy.sleep(self.boost_duration)
+                return
+        
+        # ==================== DETECT PINK MARKERS ====================
         _, crossed_pink_marker = self.stripe_detector.check_pink_stripe(img)
         
         current_state = self.state_machine.state
 
-        # PRE-TUNNEL FORWARD DRIVE (after capturing sign 5, before tunnel search)
+        # ==================== PRE-TUNNEL FORWARD DRIVE ====================
         if self.pre_tunnel_forward:
             cmd = Twist()
             cmd.linear.x = 1.0
@@ -150,60 +278,50 @@ class ControllerNode:
             
             if self.pre_tunnel_frames >= self.pre_tunnel_duration:
                 self.pre_tunnel_forward = False
-                rospy.loginfo("[PRE-TUNNEL] Forward drive complete, starting tunnel navigation")
+                rospy.loginfo("[PRE-TUNNEL] Forward drive complete")
             
             self.cmd_pub.publish(cmd)
             return
 
-        # TUNNEL NAVIGATION STATE
+        # ==================== TUNNEL NAVIGATION STATE ====================
         if current_state == StateMachine.START_GRASS_NO_ROAD:
-            # Determine which sign to look for based on tunnel navigator phase
             tunnel_phase = self.tunnel_navigator.phase
             
-            # Phase 3 = rotating to find sign at tunnel entrance
             if tunnel_phase == 3:
                 tunnel_sign_captured = self.sign_captured[6]
                 cmd, complete = self.tunnel_navigator.navigate(img, sign_captured=tunnel_sign_captured)
                 
-                # Try to capture sign 6
                 if not self.sign_captured[6]:
                     sign_cmd = self.try_capture_sign(img, cmd, phase=6)
                     if sign_cmd.linear.x != cmd.linear.x or sign_cmd.angular.z != cmd.angular.z:
                         cmd = sign_cmd
             else:
-                # Other tunnel phases
                 cmd, complete = self.tunnel_navigator.navigate(img, sign_captured=self.sign_captured[6])
             
             self.cmd_pub.publish(cmd)
             return
 
-        # CLIMBING MOUNTAIN STATE (Looking for Sign 7)
+        # ==================== CLIMBING MOUNTAIN STATE ====================
         if current_state == StateMachine.CLIMBING_MOUNTAIN:
-            # Continue using tunnel navigator for white line following (Phase 6 logic)
             cmd, complete = self.tunnel_navigator.navigate(img, sign_captured=True)
 
-            # Look for Sign 7 (Final Sign)
             if not self.sign_captured[7]:
                 captured = self.try_capture_sign_mountain(img, phase=7)
                 
                 if captured:
-                    # Sign 7 captured - stop the run!
                     rospy.loginfo("="*70)
                     rospy.loginfo("FINAL SIGN 7 CAPTURED! STOPPING RUN.")
                     rospy.loginfo("="*70)
                     
                     stop_cmd = Twist()
-                    stop_cmd.linear.x = 0.0
-                    stop_cmd.angular.z = 0.0
                     self.cmd_pub.publish(stop_cmd)
-                    
                     self.stop_run()
                     return
 
             self.cmd_pub.publish(cmd)
             return
         
-        # Update state machine
+        # ==================== UPDATE STATE MACHINE ====================
         events = {
             "crossed_crosswalk": crossed_crosswalk,
             "sign1_captured": self.sign_captured[1],
@@ -218,58 +336,54 @@ class ControllerNode:
 
         actions = self.state_machine.update(events)
         
-        # Start timer on first frame
         if actions["start_timer"] and not self.run_active:
             self.start_run()
         
-        # Get movement command
-        cmd = Twist()
-        
+        # ==================== NORMAL DRIVING ====================
         if self.run_active:
             drive_mode = actions["drive_mode"]
             self.current_phase = actions["sign_phase"]
 
-            # Switch lane follower detection mode based on drive mode
             if drive_mode == "grass_road":
                 self.lane_follower.detection_mode = "grass"
             else:
                 self.lane_follower.detection_mode = "asphalt"
-
-            # CHECK FOR RECOVERY MANEUVER FIRST
-            if self.grass_sign_recovery and self.recovery_frames < self.recovery_duration:
-                cmd.linear.x = 0.0
-                cmd.angular.z = -1.8
-                
-                self.recovery_frames += 1
-                
-                if self.recovery_frames >= self.recovery_duration:
-                    self.grass_sign_recovery = False
-
-                self.cmd_pub.publish(cmd)
-                return
             
-            # Lane following with different biases for different sections
+            # Lane following
             if drive_mode == "normal":
                 cmd = self.lane_follower.get_command(img, center_bias=0.0)
-            
             elif drive_mode == "after_crosswalk":
                 cmd = self.lane_follower.get_command(img, center_bias=0.0)
-            
             elif drive_mode == "in_loop":
-                cmd = self.lane_follower.get_command(img, center_bias=0.035)
-            
+                # Track when we entered the loop
+                if self.in_loop_start_time is None:
+                    self.in_loop_start_time = rospy.Time.now()
+                    rospy.loginfo("[LOOP] Entered loop - using CENTER driving with LEFT BIAS to enter clockwise")
+                
+                elapsed = (rospy.Time.now() - self.in_loop_start_time).to_sec()
+                
+                # First 4 seconds: drive with LEFT BIAS to enter loop clockwise (go left into loop)
+                if elapsed < 4.0:
+                    rospy.loginfo_throttle(1.0, f"[LOOP] Center driving with left bias... {elapsed:.1f}s / 4.0s")
+                    cmd = self.lane_follower.get_command(img, center_bias=0.035)  # Positive = aim left
+                else:
+                    # After 4 seconds: switch to LEFT LINE following
+                    if elapsed < 4.5:  # Log once when switching
+                        rospy.loginfo("[LOOP] Switching to LEFT LINE following mode!")
+                    cmd = self.lane_follower.get_command_loop(img)
             elif drive_mode == "exit_loop":
                 cmd = self.lane_follower.get_command(img, center_bias=-0.15)
-
             elif drive_mode == "grass_road":
                 cmd = self.lane_follower.get_command(img, center_bias=0.0)
                 cmd.linear.x = 1.0
 
-            # Try to capture sign if we haven't yet in this phase
+            # Try to capture sign (respects cooldown)
             if self.current_phase is not None and not self.sign_captured[self.current_phase]:
-                cmd = self.try_capture_sign(img, cmd)
+                # Check cooldown before even trying
+                if now >= self.sign_cooldown_time:
+                    cmd = self.try_capture_sign(img, cmd)
             
-            # Track distance while in loop
+            # Track loop distance
             if drive_mode == "in_loop":
                 self.update_loop_distance(cmd)
             else:
@@ -280,9 +394,7 @@ class ControllerNode:
     
     # ========== Loop Distance Tracking ==========
     def update_loop_distance(self, cmd):
-        """Track how far we've driven in the loop"""
         now = rospy.Time.now().to_sec()
-        
         if self.last_time is None:
             self.last_time = now
         else:
@@ -290,40 +402,29 @@ class ControllerNode:
             if dt > 0:
                 self.loop_distance += abs(cmd.linear.x) * dt
             self.last_time = now
-        
         if self.loop_distance >= 14.0:
             self.loop_complete = True
     
-    # ========== Sign Detection and Capture ==========
+    # ========== Sign Detection ==========
     def classify_word_groups(self, groups):
-        """
-        groups: list of lists of letter images
-                Example: [ [L1,L2,L3], [L4,L5] ]
-        Returns: list of strings
-                Example: ["BIG", "HOUSE"]
-        """
         words = []
         for word in groups:
             chars = [self.classifier.predict_letter(L) for L in word]
             words.append("".join(chars))
         return words
 
-
-    def try_capture_sign(self, img, cmd):
-        """Align with sign and capture it"""
+    def try_capture_sign(self, img, cmd, phase=None):
         now = rospy.Time.now()
         
+        # Double-check cooldown
         if now < self.sign_cooldown_time:
             return cmd
         
-        # Use provided phase or current phase
         target_phase = phase if phase is not None else self.current_phase
-        
         if target_phase is None:
             return cmd
         
         use_light_blue = (self.sign_colors[target_phase] == "light_blue")
-        
         sign = self.sign_detector.find_sign(img, use_light_blue=use_light_blue)
         
         if sign is None:
@@ -342,107 +443,105 @@ class ControllerNode:
         if x_pos < 0.35:
             cmd.angular.z = 0.8
             return cmd
-        
         if x_pos > 0.65:
             cmd.angular.z = -0.8
             return cmd
         
-        # Check if it's big enough
+        # Approach if too small
         if size < 0.2:
             cmd.linear.x = 0.4
             cmd.angular.z = 0.0
             return cmd
         
-        # Capture it
+        # ========== SIGN IS READY TO CAPTURE ==========
+        rospy.loginfo("="*60)
+        rospy.loginfo(f"[SIGN CAPTURE] About to capture sign phase {target_phase}")
+        rospy.loginfo("="*60)
+        
         warped = self.sign_detector.warp_sign(img, sign["quad"])
-
         if warped is not None:
-            phase_name = f"sign_phase_{self.current_phase}"
-            cv.imshow(phase_name, warped)
+            #cv.imshow(f"sign_phase_{target_phase}", warped)
             cv.waitKey(1)
 
-            # 1 — remove blue border → get gray interior board
             gray_board = self.sign_detector.warp_gray_square(warped)
             if gray_board is None:
                 rospy.loginfo("gray warp failed")
                 return cmd
 
-            cv.imshow("gray_board", gray_board)
+            #cv.imshow("gray_board", gray_board)
             cv.waitKey(1)
 
-            # 2 — extract only blue letters
             letter_mask = self.sign_detector.extract_letters_only(gray_board)
-            cv.imshow("letter_mask", letter_mask)
+            #cv.imshow("letter_mask", letter_mask)
             cv.waitKey(1)
 
-            # 3 — segment into TOP words + BOTTOM words
             top_words, bottom_words = self.sign_detector.segment_words(letter_mask)
 
-            # DEBUG visualization
             for wi, word in enumerate(top_words):
                 for li, L in enumerate(word):
-                    cv.imshow(f"TOP_word{wi}_letter{li}", L)
+                    #cv.imshow(f"TOP_word{wi}_letter{li}", L)
                     cv.waitKey(1)
-
             for wi, word in enumerate(bottom_words):
                 for li, L in enumerate(word):
-                    cv.imshow(f"BOT_word{wi}_letter{li}", L)
+                    #cv.imshow(f"BOT_word{wi}_letter{li}", L)
                     cv.waitKey(1)
-            # 4 — classify letters with TFLite
+
             top_strings = self.classify_word_groups(top_words)
             bottom_strings = self.classify_word_groups(bottom_words)
 
-            # 5 — send to score tracker
             self.clue_board_number += 1
             msg = String()
             bottom_text = " ".join(bottom_strings) if bottom_strings else ""
             msg.data = f"TeamRed,multi21,{self.clue_board_number},{bottom_text}"
             self.score_pub.publish(msg)
 
-            # Print out results
             rospy.loginfo(f"{self.clue_board_number},{bottom_text}")
             rospy.loginfo(f"TOP WORDS: {top_strings}")
             rospy.loginfo(f"BOTTOM WORDS: {bottom_strings}")
 
-
-        # mark the sign captured
-        self.sign_captured[self.current_phase] = True
-        self.sign_cooldown_time = now + rospy.Duration(3)
-        cmd.linear.x = 0
-        cmd.angular.z = 0
-        rospy.loginfo(f"Captured sign in phase {target_phase}")
-        
+        # ========== MARK SIGN AS CAPTURED ==========
         self.sign_captured[target_phase] = True
+        rospy.loginfo(f"[SIGN CAPTURE] *** CAPTURED SIGN {target_phase} ***")
         
-        # If this is the grass sign (phase 4), trigger recovery maneuver
-        if target_phase == 4:
-            self.grass_sign_recovery = True
-            self.recovery_frames = 0
-        
-        # If this is the bridge sign (phase 5), trigger pre-tunnel forward drive
-        if target_phase == 5:
-            rospy.loginfo("[SIGN 5] Captured! Starting pre-tunnel forward drive")
+        # ========== SET COOLDOWN AND SPECIAL ACTIONS BASED ON WHICH SIGN ==========
+        if target_phase == 3:
+            # After exit loop sign (sign 3), wait 5 seconds before looking for sign 4
+            self.sign_cooldown_time = now + rospy.Duration(5.0)
+            rospy.loginfo(f"[SIGN 3] 5 second cooldown before looking for sign 4")
+            
+        elif target_phase == 4:
+            # ========== GRASS SIGN - TRIGGER RECOVERY SEQUENCE ==========
+            rospy.loginfo("="*60)
+            rospy.loginfo("[SIGN 4 - GRASS] *** TRIGGERING GRASS RECOVERY ***")
+            rospy.loginfo("[SIGN 4 - GRASS] Will pause for 1 second, then turn RIGHT")
+            rospy.loginfo("="*60)
+            
+            self.sign_cooldown_time = now + rospy.Duration(3.0)
+            self.grass_recovery_state = "pausing"
+            self.grass_recovery_start_time = now
+            self.grass_recovery_turn_frames = 0
+            
+        elif target_phase == 5:
+            # Bridge sign - trigger pre-tunnel forward drive
+            self.sign_cooldown_time = now + rospy.Duration(3.0)
             self.pre_tunnel_forward = True
             self.pre_tunnel_frames = 0
-        
-        self.sign_cooldown_time = now + rospy.Duration(3.0)
+            rospy.loginfo(f"[SIGN 5] Starting pre-tunnel forward drive")
+            
+        else:
+            # Default 3 second cooldown
+            self.sign_cooldown_time = now + rospy.Duration(3.0)
         
         cmd.linear.x = 0.0
         cmd.angular.z = 0.0
-        
         return cmd
 
     def try_capture_sign_mountain(self, img, phase=7):
-        """Try to capture sign during mountain climb - returns True if captured"""
         now = rospy.Time.now()
-        
         if now < self.sign_cooldown_time:
             return False
         
-        target_phase = phase
-        
-        use_light_blue = (self.sign_colors[target_phase] == "light_blue")
-        
+        use_light_blue = (self.sign_colors[phase] == "light_blue")
         sign = self.sign_detector.find_sign(img, use_light_blue=use_light_blue)
         
         if sign is None:
@@ -455,24 +554,17 @@ class ControllerNode:
         x_pos = sign_x / width
         size = sign_width / width
         
-        rospy.loginfo_throttle(0.5, f"[MOUNTAIN SIGN 7] Detected! x_pos={x_pos:.2f}, size={size:.3f}")
+        rospy.loginfo_throttle(0.5, f"[MOUNTAIN SIGN 7] x_pos={x_pos:.2f}, size={size:.3f}")
         
-        # Capture when sign is big enough and reasonably centered
         if size >= 0.12 and 0.2 < x_pos < 0.8:
-            # Capture it
             warped = self.sign_detector.warp_sign(img, sign["quad"])
-            
             if warped is not None:
-                phase_name = f"sign_phase_{target_phase}"
-                cv.imshow(phase_name, warped)
+                #cv.imshow(f"sign_phase_{phase}", warped)
                 cv.waitKey(1)
-                rospy.loginfo("="*60)
-                rospy.loginfo(f"[MOUNTAIN] CAPTURED SIGN {target_phase}!")
-                rospy.loginfo("="*60)
+                rospy.loginfo(f"[MOUNTAIN] CAPTURED SIGN {phase}!")
             
-            self.sign_captured[target_phase] = True
+            self.sign_captured[phase] = True
             self.sign_cooldown_time = now + rospy.Duration(3.0)
-            
             return True
         
         return False

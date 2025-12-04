@@ -238,7 +238,7 @@ class TunnelNavigator:
         
         # Gradually increasing right turn as we go down the hill
         # Start at -0.25, end at -0.40 over 200 frames
-        max_frames = 207
+        max_frames = 209
         min_turn = -0.29      # Starting angular.z
         max_turn = -0.42      # Final angular.z (right turn)
         
@@ -285,10 +285,10 @@ class TunnelNavigator:
         # Keep rotating left to find sign
         rospy.loginfo_throttle(0.5, f"[PHASE 3] Rotating left to find sign - frame {self.frames_in_phase}")
         cmd.linear.x = 0.0
-        cmd.angular.z = 1.2  # Rotate left
+        cmd.angular.z = -1.2  # Rotate left
         
         # Safety timeout
-        if self.frames_in_phase > 200:
+        if self.frames_in_phase > 700:
             rospy.logwarn("[PHASE 3] Rotation timeout, proceeding to traverse tunnel")
             self.phase = 5
             self.frames_in_phase = 0
@@ -303,7 +303,7 @@ class TunnelNavigator:
         rospy.loginfo_throttle(0.5, f"[PHASE 4] Rotating right - frame {self.post_sign_rotation_frames}/{self.post_sign_rotation_duration}")
         
         cmd.linear.x = 0.0
-        cmd.angular.z = -1.3  # Rotate right
+        cmd.angular.z = -1.45  # Rotate right
         
         self.post_sign_rotation_frames += 1
         
@@ -355,7 +355,7 @@ class TunnelNavigator:
         kernel = np.ones((5, 5), np.uint8)
         edges = cv.dilate(edges, kernel, iterations=1)
         
-        cv.imshow("tunnel_edges", edges)
+        #cv.imshow("tunnel_edges", edges)
         cv.waitKey(1)
         
         # Split frame into left and right halves
@@ -415,7 +415,7 @@ class TunnelNavigator:
             cv.line(debug_img, (int(current), 0), (int(current), roi_h), (255, 0, 0), 2)
             cv.putText(debug_img, f"error={error:.2f} turn={turn_speed:.2f}", (10, 30),
                     cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv.imshow("tunnel_wall_detection", debug_img)
+            #cv.imshow("tunnel_wall_detection", debug_img)
             cv.waitKey(1)
             
         elif left_wall_x is not None:
@@ -475,7 +475,7 @@ class TunnelNavigator:
         mask = self.remove_small_contours(mask, 500)
         
         # Debug visualization
-        cv.imshow("mountain_adaptive_mask", mask)
+        #cv.imshow("mountain_adaptive_mask", mask)
         cv.waitKey(1)
         
         # Find left edge of white line at 15% from bottom (original approach)
@@ -543,7 +543,7 @@ class TunnelNavigator:
                       cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             cv.putText(debug_img, f"Lost for {self.frames_without_line} frames", (10, 60), 
                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv.imshow("mountain_debug", debug_img)
+            #cv.imshow("mountain_debug", debug_img)
             cv.waitKey(1)
             
             return cmd
@@ -574,7 +574,7 @@ class TunnelNavigator:
         cv.line(debug_img, (0, sample_row), (w, sample_row), (255, 255, 0), 1)  # Sample row
         cv.putText(debug_img, f"avg_B={avg_B:.0f} thresh={blue_threshold} left={left}", (10, 30), 
                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv.imshow("mountain_debug", debug_img)
+        #cv.imshow("mountain_debug", debug_img)
         cv.waitKey(1)
         
         return cmd
@@ -595,7 +595,7 @@ class TunnelNavigator:
         mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
         mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
         
-        cv.imshow("tunnel_mask", mask)
+        #cv.imshow("tunnel_mask", mask)
         cv.waitKey(1)
         
         contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
@@ -640,7 +640,7 @@ class TunnelNavigator:
         # Count white pixels (brick pixels)
         brick_count = cv.countNonZero(brick_mask)
         
-        cv.imshow("brown_brick_mask", brick_mask)
+        #cv.imshow("brown_brick_mask", brick_mask)
         cv.waitKey(1)
         
         return brick_count
