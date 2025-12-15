@@ -303,7 +303,7 @@ class TunnelNavigator:
         rospy.loginfo_throttle(0.5, f"[PHASE 4] Rotating right - frame {self.post_sign_rotation_frames}/{self.post_sign_rotation_duration}")
         
         cmd.linear.x = 0.0
-        cmd.angular.z = -1.45  # Rotate right
+        cmd.angular.z = -1.6  # Rotate right
         
         self.post_sign_rotation_frames += 1
         
